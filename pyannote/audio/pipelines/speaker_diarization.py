@@ -35,6 +35,7 @@ from scipy.special import softmax
 from pyannote.audio import Audio, Inference, Model, Pipeline
 from pyannote.audio.core.io import AudioFile
 from pyannote.audio.pipelines.utils import PipelineModel, get_devices, get_model
+from pyannote.audio.utils.calibration import Calibration
 from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.signal import Binarize, binarize
 from pyannote.core import Annotation, Segment, SlidingWindow, SlidingWindowFeature
@@ -44,7 +45,9 @@ from pyannote.pipeline.parameter import Uniform
 
 from .clustering import Clustering
 
-# TODO: automagically estimate HAC threshold based on local segmentation
+# OPTION 1 -- estimate HAC threshold based on positive/negative distance distribution obtained from local constraints
+# OPTION 2 -- calibrate distance into probability based on those very distributions (equal priors ?)
+# PROBLEM -- what if no negative distance at all?
 
 
 class SpeakerDiarization(Pipeline):
@@ -129,12 +132,6 @@ class SpeakerDiarization(Pipeline):
 
         # minimum amount of speech needed to use speaker in clustering
         self.min_activity = Uniform(0.0, self._segmentation_inference.duration)
-
-        self.affinity_threshold_percentile = Uniform(0.0, 1.0)
-
-        # weights of constraints in final (constrained) affinity matrix.
-        # Between 0 and 1, where alpha = 0.0 means no constraint.
-        self.constraint_propagate = Uniform(0.0, 1.0)
 
     def initialize(self):
         """Initialize pipeline with current set of parameters"""
@@ -317,86 +314,11 @@ class SpeakerDiarization(Pipeline):
                         # TODO: investigate weighting this by (num_frames - shift) / num_frames
                         # TODO: i.e. by the duration of the common temporal support
 
-        # propagate cannot link constraints by "transitivity": if c_ij = -1 and c_jk = 1 then c_ik = -1
-        # (only when this new constraint is not conflicting with existing constraint, i.e. when c_ik = 1)
-
-        # loop on (i, j) pairs such that c_ij is either 1 or -1
-        for i, j in zip(*np.where(constraint != 0)):
-
-            # find all k for which c_ij = - c_jk and mark c_ik as cannot-link
-            # unless it has been marked as must-link (c_ik = 1) before
-            constraint[
-                i, (constraint[i] != 1.0) & (constraint[j] + constraint[i, j] == 0.0)
-            ] = -1.0
-
         # make constraint matrix symmetric
         constraint = squareform(squareform(constraint, checks=False))
-        np.fill_diagonal(constraint, 1.0)
+        np.fill_diagonal(constraint, 0.0)
 
         return constraint
-
-    def propagate_constraints(
-        self, affinity: np.ndarray, constraint: np.ndarray
-    ) -> np.ndarray:
-        """Update affinity matrix by constraint propagation
-
-        Stolen from
-        https://github.com/wq2012/SpectralCluster/blob/34d155654dbbfcda61b808a4f61afa666476b3d2/spectralcluster/constraint.py
-
-        Parameters
-        ----------
-        affinity : np.ndarray
-            (N, N) affinity matrix with values in [0, 1].
-            * affinity[i, j] = 1 indicates that i and j are very similar
-            * affinity[i, j] = 0 indicates that i and j are very dissimilar
-        constraint : np.ndarray
-            (N, N) constraint matrix with values in [-1, 1].
-            * constraint[i, j] > 0 indicates a must-link constraint
-            * constraint[i, j] < 0 indicates a cannot-link constraint
-            * constraint[i, j] = 0 indicates absence of constraint
-
-        Returns
-        -------
-        constrained_affinity : np.ndarray
-            Constrained affinity matrix.
-        propagated_constraint : np.ndarray
-            Propagated constraint matrix.
-
-        Reference
-        ---------
-        Lu, Zhiwu, and IP, Horace HS.
-        "Constrained spectral clustering via exhaustive and efficient constraint propagation."
-        ECCV 2010
-        """
-
-        degree = np.diag(np.sum(affinity, axis=1))
-        degree_norm = np.diag(1 / (np.sqrt(np.diag(degree)) + 1e-10))
-
-        # Compute affinity_norm as D^(-1/2)AD^(-1/2)
-        affinity_norm = degree_norm.dot(affinity).dot(degree_norm)
-
-        # The closed form of the final converged constraint matrix is:
-        # (1-alpha)^2 * (I-alpha*affinity_norm)^(-1) * constraint *
-        # (I-alpha*affinity_norm)^(-1). We save (I-alpha*affinity_norm)^(-1) as a
-        # `temp_value` for readibility
-        temp_value = np.linalg.inv(
-            np.eye(affinity.shape[0]) - (1 - self.constraint_propagate) * affinity_norm
-        )
-        propagated_constraint = self.constraint_propagate ** 2 * temp_value.dot(
-            constraint
-        ).dot(temp_value)
-
-        # `is_positive` is a mask matrix where values of the propagated_constraint
-        # are positive. The affinity matrix is adjusted by the final constraint
-        # matrix using equation (4) in reference paper
-        is_positive = propagated_constraint > 0
-        affinity1 = 1 - (1 - propagated_constraint * is_positive) * (
-            1 - affinity * is_positive
-        )
-        affinity2 = (1 + propagated_constraint * np.invert(is_positive)) * (
-            affinity * np.invert(is_positive)
-        )
-        return affinity1 + affinity2, propagated_constraint
 
     CACHED_SEGMENTATION = "@diarization/segmentation/raw"
 
@@ -554,12 +476,16 @@ class SpeakerDiarization(Pipeline):
                 active_reference = np.any(local_reference > 0, axis=0)
                 permutations.extend(
                     [
-                        i if ((i is not None) and (active_reference[i])) else None
+                        i if ((i is not None) and (active_reference[i])) else -1
                         for i in permutation
                     ]
                 )
 
-            debug(file, "clustering/clusters/oracle", permutations)
+            permutations = np.array(permutations)
+            oracle = squareform(pdist(permutations, metric="equal"))
+            oracle[permutations < 0] = -1
+            oracle[:, permutations < 0] = -1
+            debug(file, "clustering/affinity/oracle", oracle)
 
         # __ RAW AFFINITY ______________________________________________________________
 
@@ -569,34 +495,48 @@ class SpeakerDiarization(Pipeline):
         np.fill_diagonal(affinity, 1.0)
         debug(file, "clustering/affinity/raw", affinity)
 
-        # __ CONSTRAINED AFFINITY ______________________________________________________
+        # __ CALIBRATED AFFINITY________________________________________________________
 
-        if self.constraint_propagate > 0:
+        # compute (soft) {must/cannot}-link constraints based on local segmentation
+        constraints = self.compute_constraints(binarized_segmentations)
 
-            # compute (soft) {must/cannot}-link constraints based on local segmentation
-            constraints = self.compute_constraints(binarized_segmentations)
-
-            long = rearrange(
-                speaker_status == LONG,
-                "c s -> (c s)",
-                c=num_chunks,
-                s=local_num_speakers,
-            )
-
-            constraints = constraints[long][:, long]
-            debug(file, "clustering/constraints", constraints)
-
-            affinity, _ = self.propagate_constraints(affinity, constraints)
-            debug(file, "clustering/affinity/constrained", affinity)
-
-        # __ REFINED AFFINITY ___________________________________________________________
-
-        affinity = affinity * (
-            affinity
-            >= np.percentile(affinity, 100 * self.affinity_threshold_percentile, axis=0)
+        long = rearrange(
+            speaker_status == LONG,
+            "c s -> (c s)",
+            c=num_chunks,
+            s=local_num_speakers,
         )
-        affinity = 0.5 * (affinity + affinity.T)
-        debug(file, "clustering/affinity/refined", affinity)
+
+        constraints = constraints[long][:, long]
+        debug(file, "clustering/constraints", constraints)
+
+        same_speaker = constraints > 0
+        same_speaker_affinity = affinity[same_speaker]
+
+        diff_speaker = constraints < 0
+        if np.sum(diff_speaker) > 0:
+            diff_speaker_affinity = affinity[diff_speaker]
+
+        else:
+            msg = (
+                "Could not find pairs of different speakers for calibrating affinity. "
+                "Approximating it..."
+            )
+            warnings.warn(msg)
+            diff_speaker_affinity = affinity[affinity < np.percentile(affinity, 10)]
+
+        calibration = Calibration(equal_priors=True, method="isotonic")
+        calibration.fit(
+            np.hstack([same_speaker_affinity, diff_speaker_affinity]),
+            np.hstack(
+                [
+                    np.ones_like(same_speaker_affinity),
+                    np.zeros_like(diff_speaker_affinity),
+                ]
+            ),
+        )
+        affinity = squareform(calibration.transform(squareform(affinity, checks=False)))
+        debug(file, "clustering/affinity/calibrated", affinity)
 
         # __ ACTIVE SPEAKER CLUSTERING _________________________________________________
         # clusters[chunk_id x local_num_speakers + speaker_id] = k
@@ -684,3 +624,24 @@ class SpeakerDiarization(Pipeline):
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
         return GreedyDiarizationErrorRate(collar=0.0, skip_overlap=False)
+
+
+# propagated = np.copy(constraint)
+
+# # propagate must link constraints by "transitivity": if c_ij = 1 and c_jk  1 then c_ik = 1
+# for i, j in zip(*np.where(constraint == 1.0)):
+#     # find all k for which c_jk = 1 and mark c_ik as must-link
+#     # unless it has been marked as cannot-link (c_ik = -1) before
+#     propagated[i, (constraint[i] != -1.0) & (constraint[j] == 1.0)] = 1.0
+
+# # propagate cannot link constraints by "transitivity": if c_ij = -1 and c_jk = 1 then c_ik = -1
+# # (only when this new constraint is not conflicting with existing constraint, i.e. when c_ik = 1)
+
+# # loop on (i, j) pairs such that c_ij is either 1 or -1
+# for i, j in zip(*np.where(constraint != 0)):
+
+#     # find all k for which c_ij = - c_jk and mark c_ik as cannot-link
+#     # unless it has been marked as must-link (c_ik = 1) before
+#     propagated[
+#         i, (constraint[i] != 1.0) & (constraint[j] + constraint[i, j] == 0.0)
+#     ] = -1.0
