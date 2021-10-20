@@ -314,6 +314,18 @@ class SpeakerDiarization(Pipeline):
                         # TODO: investigate weighting this by (num_frames - shift) / num_frames
                         # TODO: i.e. by the duration of the common temporal support
 
+        # propagate cannot link constraints by "transitivity": if c_ij = -1 and c_jk = 1 then c_ik = -1
+        # (only when this new constraint is not conflicting with existing constraint, i.e. when c_ik = 1)
+
+        # loop on (i, j) pairs such that c_ij is either 1 or -1
+        for i, j in zip(*np.where(constraint != 0)):
+
+            # find all k for which c_ij = - c_jk and mark c_ik as cannot-link
+            # unless it has been marked as must-link (c_ik = 1) before
+            constraint[
+                i, (constraint[i] != 1.0) & (constraint[j] + constraint[i, j] == 0.0)
+            ] = -1.0
+
         # make constraint matrix symmetric
         constraint = squareform(squareform(constraint, checks=False))
         np.fill_diagonal(constraint, 0.0)
