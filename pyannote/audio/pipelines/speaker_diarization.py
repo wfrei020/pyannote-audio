@@ -392,6 +392,7 @@ class SpeakerDiarization(Pipeline):
         segmentations: SlidingWindowFeature = file[self.CACHED_SEGMENTATION]
         frames: SlidingWindow = self._segmentation_inference.model.introspection.frames
         duration: float = self._segmentation_inference.duration
+        step: float = self._segmentation_inference.step
 
         # apply hysteresis thresholding on each chunk
         binarized_segmentations: SlidingWindowFeature = binarize(
@@ -522,17 +523,18 @@ class SpeakerDiarization(Pipeline):
         constraints = constraints[long][:, long]
         debug(file, "clustering/constraints", constraints)
 
-        same_speaker = constraints > 0
+        half_overlap = round(0.5 * duration // step)
+        same_speaker = np.triu(constraints, k=half_overlap) > 0
         same_speaker_affinity = affinity[same_speaker]
 
-        diff_speaker = constraints < 0
+        diff_speaker = np.triu(constraints) < 0
         if np.sum(diff_speaker) > 0:
             diff_speaker_affinity = affinity[diff_speaker]
 
         else:
             msg = (
-                "Could not find pairs of different speakers for calibrating affinity. "
-                "Approximating it..."
+                f"Could not perform reliable self-calibration for file {file['uri']}. "
+                "Consider decreasing value of `min_activity` hyper-parameter (you used {min_activity:.3f})."
             )
             warnings.warn(msg)
             diff_speaker_affinity = affinity[affinity < np.percentile(affinity, 10)]
