@@ -402,7 +402,6 @@ class SpeakerDiarization(Pipeline):
         segmentations: SlidingWindowFeature = file[self.CACHED_SEGMENTATION]
         frames: SlidingWindow = self._segmentation_inference.model.introspection.frames
         duration: float = self._segmentation_inference.duration
-        step: float = self._segmentation_inference.step
 
         # apply hysteresis thresholding on each chunk
         binarized_segmentations: SlidingWindowFeature = binarize(
@@ -533,11 +532,15 @@ class SpeakerDiarization(Pipeline):
         constraints = constraints[long][:, long]
         debug(file, "clustering/constraints", constraints)
 
-        off_diagonal = max(1, round(0.5 * duration // step))
-        same_speaker = np.triu(constraints, k=off_diagonal) > 0
+        same_speaker = np.triu(constraints, k=1) > 0
         if np.sum(same_speaker) > 0:
-            same_speaker = np.triu(constraints, k=1) > 0
-        same_speaker_affinity = affinity[same_speaker]
+            same_speaker_affinity = affinity[same_speaker]
+        else:
+            msg = (
+                f"Could not perform reliable self-calibration for file {file['uri']} due to missing positive examples. "
+                f"Consider decreasing value of `min_activity` hyper-parameter (you used {self.min_activity:.3f})."
+            )
+            same_speaker_affinity = affinity.flatten()
 
         diff_speaker = np.triu(constraints) < 0
         if np.sum(diff_speaker) > 0:
@@ -545,11 +548,11 @@ class SpeakerDiarization(Pipeline):
 
         else:
             msg = (
-                f"Could not perform reliable self-calibration for file {file['uri']}. "
+                f"Could not perform reliable self-calibration for file {file['uri']} due to missing negative examples. "
                 f"Consider decreasing value of `min_activity` hyper-parameter (you used {self.min_activity:.3f})."
             )
             warnings.warn(msg)
-            diff_speaker_affinity = affinity[affinity < np.percentile(affinity, 10)]
+            diff_speaker_affinity = affinity[affinity < np.percentile(affinity, 50)]
 
         calibration = Calibration(equal_priors=True, method="sigmoid")
         calibration.fit(
