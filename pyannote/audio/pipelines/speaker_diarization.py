@@ -314,6 +314,16 @@ class SpeakerDiarization(Pipeline):
                         # TODO: investigate weighting this by (num_frames - shift) / num_frames
                         # TODO: i.e. by the duration of the common temporal support
 
+        propagated = np.copy(constraint)
+
+        # propagate must link constraints by "transitivity": if c_ij = 1 and c_jk  1 then c_ik = 1
+        for i, j in zip(*np.where(constraint == 1.0)):
+            # find all k for which c_jk = 1 and mark c_ik as must-link
+            # unless it has been marked as cannot-link (c_ik = -1) before
+            propagated[i, (constraint[i] != -1.0) & (constraint[j] == 1.0)] = 1.0
+
+        constraint = np.copy(propagated)
+
         # propagate cannot link constraints by "transitivity": if c_ij = -1 and c_jk = 1 then c_ik = -1
         # (only when this new constraint is not conflicting with existing constraint, i.e. when c_ik = 1)
 
@@ -322,15 +332,15 @@ class SpeakerDiarization(Pipeline):
 
             # find all k for which c_ij = - c_jk and mark c_ik as cannot-link
             # unless it has been marked as must-link (c_ik = 1) before
-            constraint[
+            propagated[
                 i, (constraint[i] != 1.0) & (constraint[j] + constraint[i, j] == 0.0)
             ] = -1.0
 
         # make constraint matrix symmetric
-        constraint = squareform(squareform(constraint, checks=False))
-        np.fill_diagonal(constraint, 0.0)
+        propagated = squareform(squareform(propagated, checks=False))
+        np.fill_diagonal(propagated, 0.0)
 
-        return constraint
+        return propagated
 
     CACHED_SEGMENTATION = "@diarization/segmentation/raw"
 
@@ -523,8 +533,10 @@ class SpeakerDiarization(Pipeline):
         constraints = constraints[long][:, long]
         debug(file, "clustering/constraints", constraints)
 
-        off_diagonal = round(0.75 * duration // step)
+        off_diagonal = max(1, round(0.5 * duration // step))
         same_speaker = np.triu(constraints, k=off_diagonal) > 0
+        if np.sum(same_speaker) > 0:
+            same_speaker = np.triu(constraints, k=1) > 0
         same_speaker_affinity = affinity[same_speaker]
 
         diff_speaker = np.triu(constraints) < 0
@@ -534,12 +546,12 @@ class SpeakerDiarization(Pipeline):
         else:
             msg = (
                 f"Could not perform reliable self-calibration for file {file['uri']}. "
-                "Consider decreasing value of `min_activity` hyper-parameter (you used {min_activity:.3f})."
+                f"Consider decreasing value of `min_activity` hyper-parameter (you used {self.min_activity:.3f})."
             )
             warnings.warn(msg)
             diff_speaker_affinity = affinity[affinity < np.percentile(affinity, 10)]
 
-        calibration = Calibration(equal_priors=True, method="isotonic")
+        calibration = Calibration(equal_priors=True, method="sigmoid")
         calibration.fit(
             np.hstack([same_speaker_affinity, diff_speaker_affinity]),
             np.hstack(
@@ -550,6 +562,7 @@ class SpeakerDiarization(Pipeline):
             ),
         )
         affinity = squareform(calibration.transform(squareform(affinity, checks=False)))
+        np.fill_diagonal(affinity, 1.0)
         debug(file, "clustering/affinity/calibrated", affinity)
 
         # __ ACTIVE SPEAKER CLUSTERING _________________________________________________
@@ -638,24 +651,3 @@ class SpeakerDiarization(Pipeline):
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
         return GreedyDiarizationErrorRate(collar=0.0, skip_overlap=False)
-
-
-# propagated = np.copy(constraint)
-
-# # propagate must link constraints by "transitivity": if c_ij = 1 and c_jk  1 then c_ik = 1
-# for i, j in zip(*np.where(constraint == 1.0)):
-#     # find all k for which c_jk = 1 and mark c_ik as must-link
-#     # unless it has been marked as cannot-link (c_ik = -1) before
-#     propagated[i, (constraint[i] != -1.0) & (constraint[j] == 1.0)] = 1.0
-
-# # propagate cannot link constraints by "transitivity": if c_ij = -1 and c_jk = 1 then c_ik = -1
-# # (only when this new constraint is not conflicting with existing constraint, i.e. when c_ik = 1)
-
-# # loop on (i, j) pairs such that c_ij is either 1 or -1
-# for i, j in zip(*np.where(constraint != 0)):
-
-#     # find all k for which c_ij = - c_jk and mark c_ik as cannot-link
-#     # unless it has been marked as must-link (c_ik = 1) before
-#     propagated[
-#         i, (constraint[i] != 1.0) & (constraint[j] + constraint[i, j] == 0.0)
-#     ] = -1.0
