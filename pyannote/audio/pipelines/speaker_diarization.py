@@ -523,8 +523,8 @@ class SpeakerDiarization(Pipeline):
         constraints = constraints[long][:, long]
         debug(file, "clustering/constraints", constraints)
 
-        half_overlap = round(0.5 * duration // step)
-        same_speaker = np.triu(constraints, k=half_overlap) > 0
+        off_diagonal = round(0.75 * duration // step)
+        same_speaker = np.triu(constraints, k=off_diagonal) > 0
         same_speaker_affinity = affinity[same_speaker]
 
         diff_speaker = np.triu(constraints) < 0
