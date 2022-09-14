@@ -222,6 +222,7 @@ class SpeechBrainPretrainedSpeakerEmbedding:
         self,
         embedding: Text = "speechbrain/spkrec-ecapa-voxceleb",
         device: torch.device = None,
+        overrides: dict = {}
     ):
 
         if not SPEECHBRAIN_IS_AVAILABLE:
@@ -237,6 +238,7 @@ class SpeechBrainPretrainedSpeakerEmbedding:
         self.classifier_ = SpeechBrain_EncoderClassifier.from_hparams(
             source=self.embedding,
             savedir=f"{CACHE_DIR}/speechbrain",
+            overrides=overrides,
             run_opts={"device": self.device},
         )
 
